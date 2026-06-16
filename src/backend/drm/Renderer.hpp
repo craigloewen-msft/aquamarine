@@ -93,6 +93,10 @@ namespace Aquamarine {
         static Hyprutils::Memory::CSharedPointer<CDRMRenderer> attempt(Hyprutils::Memory::CSharedPointer<CBackend> backend_, int drmFD);
         static Hyprutils::Memory::CSharedPointer<CDRMRenderer> attempt(Hyprutils::Memory::CSharedPointer<CBackend>      backend_,
                                                                        Hyprutils::Memory::CSharedPointer<CGBMAllocator> allocator_);
+        // WSL/WSLg path: create a GLES context on /dev/dxg via Mesa's d3d12
+        // driver using the EGL device/surfaceless platform, with no DRM render
+        // node and no GBM device. See docs/RUNNING-ON-WSLG.md.
+        static Hyprutils::Memory::CSharedPointer<CDRMRenderer> attemptDxg(Hyprutils::Memory::CSharedPointer<CBackend> backend_);
 
         int                                                    drmFD = -1;
 

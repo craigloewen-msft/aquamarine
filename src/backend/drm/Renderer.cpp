@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cstdlib>
 #include "Math.hpp"
 #include "Shared.hpp"
 #include "FormatUtils.hpp"
@@ -644,6 +645,70 @@ SP<CDRMRenderer> CDRMRenderer::attempt(SP<CBackend> backend_, Hyprutils::Memory:
         return nullptr;
 
     renderer->initResources();
+
+    return renderer;
+}
+
+SP<CDRMRenderer> CDRMRenderer::attemptDxg(SP<CBackend> backend_) {
+    // WSL/WSLg has no DRM render node (/dev/dri/renderD*); the GPU is reached
+    // through Mesa's d3d12 Gallium driver talking to /dev/dxg via libdxcore.
+    // We therefore create the EGL display via the device/surfaceless platform
+    // instead of GBM. Mesa routes to the GPU when GALLIUM_DRIVER=d3d12 is set
+    // (otherwise it silently falls back to llvmpipe software rendering).
+    SP<CDRMRenderer> renderer = SP<CDRMRenderer>(new CDRMRenderer());
+    renderer->drmFD           = -1;
+    renderer->backend         = backend_;
+    gBackend                  = backend_;
+
+    // On WSL, Mesa defaults to llvmpipe (software) unless told to use the d3d12
+    // Gallium driver. If the user hasn't chosen a driver and /dev/dxg is
+    // present, opt into hardware acceleration. Only set when unset so an
+    // explicit GALLIUM_DRIVER/LIBGL_ALWAYS_SOFTWARE choice is respected.
+    if (!getenv("GALLIUM_DRIVER") && !getenv("LIBGL_ALWAYS_SOFTWARE") && access("/dev/dxg", F_OK) == 0) {
+        setenv("GALLIUM_DRIVER", "d3d12", 0);
+        backend_->log(AQ_LOG_DEBUG, "CDRMRenderer(dxg): /dev/dxg present, defaulting GALLIUM_DRIVER=d3d12 for hardware acceleration");
+    }
+
+    renderer->loadEGLAPI();
+
+    std::vector<EGLint> attrs;
+    if (renderer->exts.KHR_display_reference) {
+        attrs.push_back(EGL_TRACK_REFERENCES_KHR);
+        attrs.push_back(EGL_TRUE);
+    }
+    attrs.push_back(EGL_NONE);
+
+    // Prefer the device platform (lets Mesa pick the d3d12 adapter), then fall
+    // back to the surfaceless platform. Both were verified to yield a hardware
+    // D3D12 context on /dev/dxg.
+    if (renderer->exts.EXT_platform_device && renderer->proc.eglQueryDevicesEXT) {
+        EGLDeviceEXT devices[16];
+        EGLint       nDevices = 0;
+        if (renderer->proc.eglQueryDevicesEXT(16, devices, &nDevices) == EGL_TRUE && nDevices > 0) {
+            backend_->log(AQ_LOG_DEBUG, std::format("CDRMRenderer(dxg): {} EGL device(s) enumerated, using device[0]", nDevices));
+            renderer->egl.display = renderer->proc.eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, devices[0], attrs.data());
+        }
+    }
+
+    if (renderer->egl.display == nullptr || renderer->egl.display == EGL_NO_DISPLAY) {
+        backend_->log(AQ_LOG_DEBUG, "CDRMRenderer(dxg): device platform unavailable, trying EGL_PLATFORM_SURFACELESS_MESA");
+        renderer->egl.display = renderer->proc.eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, attrs.data());
+    }
+
+    if (renderer->egl.display == nullptr || renderer->egl.display == EGL_NO_DISPLAY) {
+        backend_->log(AQ_LOG_ERROR, "CDRMRenderer(dxg): fail, eglGetPlatformDisplayEXT failed for both device and surfaceless platforms");
+        return nullptr;
+    }
+
+    renderer->initContext();
+    if (renderer->egl.context == nullptr || renderer->egl.context == EGL_NO_CONTEXT) {
+        backend_->log(AQ_LOG_ERROR, "CDRMRenderer(dxg): fail, no EGL context");
+        return nullptr;
+    }
+
+    renderer->initResources();
+
+    backend_->log(AQ_LOG_DEBUG, "CDRMRenderer(dxg): renderer ready (no GBM, no DRM node)");
 
     return renderer;
 }

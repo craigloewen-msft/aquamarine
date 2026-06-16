@@ -129,6 +129,16 @@ int Aquamarine::CHeadlessBackend::drmFD() {
     return -1;
 }
 
+// On WSL/WSLg there is no DRM render node (/dev/dri/renderD*), so a GBM
+// allocator cannot be created. When the headless backend is the only backend
+// (e.g. a VNC/headless session), request a host-memory (wl_shm) allocator so
+// outputs can allocate buffers that the GL renderer reads back into.
+// On a normal system a DRM backend is present and supplies the GBM allocator
+// first, so this shm fallback is only consulted when no DRM node exists.
+bool Aquamarine::CHeadlessBackend::usesShmAllocator() {
+    return true;
+}
+
 int Aquamarine::CHeadlessBackend::drmRenderNodeFD() {
     return -1;
 }

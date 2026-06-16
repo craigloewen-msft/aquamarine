@@ -5,6 +5,8 @@
 #include "Shared.hpp"
 #include "FormatUtils.hpp"
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <xf86drm.h>
 #include <gbm.h>
 #include <fcntl.h>
@@ -116,23 +118,29 @@ bool Aquamarine::CWaylandBackend::start() {
         const std::string NAME = name;
 
         if (NAME == "wl_seat") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 9, id)));
-            waylandState.seat = makeShared<CCWlSeat>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_seat_interface, 9));
+            const uint32_t BIND = std::min(version, 9u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, BIND, id)));
+            waylandState.seat = makeShared<CCWlSeat>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_seat_interface, BIND));
             initSeat();
         } else if (NAME == "xdg_wm_base") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 6, id)));
-            waylandState.xdg = makeShared<CCXdgWmBase>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &xdg_wm_base_interface, 6));
+            const uint32_t BIND = std::min(version, 6u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, BIND, id)));
+            waylandState.xdg = makeShared<CCXdgWmBase>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &xdg_wm_base_interface, BIND));
             initShell();
         } else if (NAME == "wl_compositor") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 6, id)));
-            waylandState.compositor = makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, 6));
+            const uint32_t BIND = std::min(version, 6u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, BIND, id)));
+            waylandState.compositor =
+                makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, BIND));
         } else if (NAME == "wl_shm") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 1, id)));
-            waylandState.shm = makeShared<CCWlShm>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_shm_interface, 1));
+            const uint32_t BIND = std::min(version, 1u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, BIND, id)));
+            waylandState.shm = makeShared<CCWlShm>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_shm_interface, BIND));
         } else if (NAME == "zwp_linux_dmabuf_v1") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 4, id)));
+            const uint32_t BIND = std::min(version, 4u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, BIND, id)));
             waylandState.dmabuf =
-                makeShared<CCZwpLinuxDmabufV1>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &zwp_linux_dmabuf_v1_interface, 4));
+                makeShared<CCZwpLinuxDmabufV1>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &zwp_linux_dmabuf_v1_interface, BIND));
             if (!initDmabuf()) {
                 backend->log(AQ_LOG_ERROR, "Wayland backend cannot start: zwp_linux_dmabuf_v1 init failed");
                 waylandState.dmabufFailed = true;
@@ -143,9 +151,25 @@ bool Aquamarine::CWaylandBackend::start() {
 
     wl_display_roundtrip(waylandState.display);
 
-    if (!waylandState.xdg || !waylandState.compositor || !waylandState.seat || !waylandState.dmabuf || waylandState.dmabufFailed || !waylandState.shm) {
+    if (!waylandState.xdg || !waylandState.compositor || !waylandState.seat || !waylandState.shm) {
         backend->log(AQ_LOG_ERROR, "Wayland backend cannot start: Missing protocols");
         return false;
+    }
+
+    // if the host compositor does not offer a working zwp_linux_dmabuf_v1 (e.g.
+    // WSLg, which only speaks wl_shm), fall back to a host-memory (shm) present
+    // path. Frames are rendered on the GPU and copied into wl_shm buffers.
+    shmMode = !waylandState.dmabuf || waylandState.dmabufFailed;
+    if (shmMode) {
+        waylandState.dmabuf.reset();
+        waylandState.dmabufFeedback.reset();
+        waylandState.dmabufFailed = false;
+        // wl_shm mandates these two formats; advertise them as our render formats.
+        shmFormats = {
+            SDRMFormat{.drmFormat = DRM_FORMAT_ARGB8888, .modifiers = {DRM_FORMAT_MOD_LINEAR}},
+            SDRMFormat{.drmFormat = DRM_FORMAT_XRGB8888, .modifiers = {DRM_FORMAT_MOD_LINEAR}},
+        };
+        backend->log(AQ_LOG_DEBUG, "Wayland backend: no dmabuf available, using a host-memory (wl_shm) present path");
     }
 
     dispatchEvents();
@@ -214,6 +238,12 @@ bool Aquamarine::CWaylandBackend::dispatchEvents() {
         }
         idleCallbacks.clear();
     }
+
+    // idle callbacks (e.g. the first frame after a configure) may have queued
+    // requests like a buffer attach/commit or a frame callback. Flush them now,
+    // otherwise the host never sees the commit and never sends frame.done, which
+    // stalls the render loop (notably the very first frame).
+    wl_display_flush(waylandState.display);
 
     return true;
 }
@@ -470,11 +500,19 @@ bool Aquamarine::CWaylandBackend::initDmabuf() {
 }
 
 std::vector<SDRMFormat> Aquamarine::CWaylandBackend::getRenderFormats() {
+    if (shmMode)
+        return shmFormats;
     return dmabufFormats;
 }
 
 std::vector<SDRMFormat> Aquamarine::CWaylandBackend::getCursorFormats() {
+    if (shmMode)
+        return shmFormats;
     return dmabufFormats;
+}
+
+bool Aquamarine::CWaylandBackend::usesShmAllocator() {
+    return shmMode;
 }
 
 SP<IAllocator> Aquamarine::CWaylandBackend::preferredAllocator() {
@@ -509,6 +547,33 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
     waylandState.xdgSurface->setConfigure([this](CCXdgSurface* r, uint32_t serial) {
         backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: configure surface with {}", name, serial));
         r->sendAckConfigure(serial);
+
+        // On the first configure the surface becomes presentable. If a buffer
+        // was committed before we were configured, present it now.
+        if (!xdgConfigured) {
+            xdgConfigured = true;
+            if (pendingCommitBuffer) {
+                backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: flushing buffer deferred until first configure", name));
+                waylandState.surface->sendAttach(pendingCommitBuffer->waylandState.buffer.get(), 0, 0);
+                waylandState.surface->sendDamageBuffer(0, 0, INT32_MAX, INT32_MAX);
+                readyForFrameCallback = true;
+                pendingCommitBuffer.reset();
+
+                // Bootstrap the render loop directly instead of going through
+                // scheduleFrame()/idleCallbacks: idle callbacks are only drained
+                // inside dispatchEvents(), and right after the first configure the
+                // host has nothing to send us, so the wl fd stays quiet and the
+                // idle callback would never run. By requesting a frame callback and
+                // committing here, the host presents the buffer and sends
+                // frame.done, which arrives over the wl fd, runs onFrameDone() from
+                // inside dispatchEvents(), and from then on the loop self-sustains.
+                frameScheduled             = false;
+                frameScheduledWhileWaiting = false;
+                waylandState.frameCallback = makeShared<CCWlCallback>(waylandState.surface->sendFrame());
+                waylandState.frameCallback->setDone([this](CCWlCallback* r, uint32_t ms) { onFrameDone(); });
+                waylandState.surface->sendCommit();
+            }
+        }
     });
 
     waylandState.xdgToplevel = makeShared<CCXdgToplevel>(waylandState.xdgSurface->sendGetToplevel());
@@ -524,18 +589,45 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
     waylandState.xdgToplevel->setConfigure([this](CCXdgToplevel* r, int32_t w, int32_t h, wl_array* arr) {
         backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: configure toplevel with {}x{}", name, w, h));
         if (w == 0 || h == 0) {
-            backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: w/h is 0, sending default hardcoded 1280x720", name));
+            // The host (e.g. WSLg's Weston) left the size up to us. Default to
+            // 1280x720, but allow AQ_WAYLAND_OUTPUT_SIZE=WIDTHxHEIGHT to request a
+            // larger nested window (e.g. 1920x1080 for a fullscreen-ish desktop).
             w = 1280;
             h = 720;
+            if (const char* sizeEnv = std::getenv("AQ_WAYLAND_OUTPUT_SIZE")) {
+                int envW = 0, envH = 0;
+                if (std::sscanf(sizeEnv, "%dx%d", &envW, &envH) == 2 && envW > 0 && envH > 0) {
+                    w = envW;
+                    h = envH;
+                } else
+                    backend->backend->log(AQ_LOG_ERROR,
+                                          std::format("Output {}: ignoring malformed AQ_WAYLAND_OUTPUT_SIZE='{}', expected WIDTHxHEIGHT", name, sizeEnv));
+            }
+            backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: w/h is 0, using default {}x{}", name, w, h));
         }
         events.state.emit(SStateEvent{.size = {w, h}});
-        sendFrameAndSetCallback();
+        // schedule the frame on the idle queue instead of emitting it synchronously:
+        // the xdg_surface.configure that follows this toplevel.configure must be
+        // acked (and flushed) before we may attach a buffer, otherwise the host
+        // rejects the surface with "xdg_surface has never been configured".
+        scheduleFrame(AQ_SCHEDULE_NEW_CONNECTOR);
     });
 
     waylandState.xdgToplevel->setClose([this](CCXdgToplevel* r) { destroy(); });
 
     waylandState.xdgToplevel->sendSetTitle(std::format("aquamarine - {}", name).c_str());
     waylandState.xdgToplevel->sendSetAppId("aquamarine");
+
+    // Ask the host compositor (e.g. WSLg's Weston) to make this nested window
+    // fullscreen, so the Hyprland session fills the screen like a real desktop
+    // instead of floating in a normal window. Opt-in via AQ_WAYLAND_FULLSCREEN=1
+    // (set by dev-env/start-wslg.sh when WSLG_FULLSCREEN=1). When honored, the
+    // host replies with a configure carrying the real screen size, which the
+    // handler above uses verbatim (so AQ_WAYLAND_OUTPUT_SIZE becomes a fallback).
+    if (const char* fs = std::getenv("AQ_WAYLAND_FULLSCREEN"); fs && fs[0] == '1') {
+        backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: requesting host fullscreen (AQ_WAYLAND_FULLSCREEN=1)", name));
+        waylandState.xdgToplevel->sendSetFullscreen(nullptr);
+    }
 
     auto inputRegion = makeShared<CCWlRegion>(backend->waylandState.compositor->sendCreateRegion());
     inputRegion->sendAdd(0, 0, INT32_MAX, INT32_MAX);
@@ -636,9 +728,53 @@ bool Aquamarine::CWaylandOutput::commit() {
 
     wlBuffer->pendingRelease = true;
 
+    // We may not attach a buffer before the host has sent (and we have acked)
+    // the first xdg_surface.configure. Stash the buffer and present it from the
+    // configure handler instead.
+    if (!xdgConfigured) {
+        backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: deferring commit until first xdg_surface.configure", name));
+        pendingCommitBuffer = wlBuffer;
+        events.commit.emit();
+        state->onCommit();
+        needsFrame = false;
+        return true;
+    }
+
     waylandState.surface->sendAttach(wlBuffer->waylandState.buffer.get(), 0, 0);
     waylandState.surface->sendDamageBuffer(0, 0, INT32_MAX, INT32_MAX);
     waylandState.surface->sendCommit();
+
+    // One-shot frame dump for verifying shm readback correctness (color/orientation).
+    if (const char* dumpEnv = std::getenv("AQ_DUMP_FRAME")) {
+        static int  frameNo  = 0;
+        static bool dumped   = false;
+        int         dumpAt   = atoi(dumpEnv);
+        if (dumpAt < 1)
+            dumpAt = 200;
+        ++frameNo;
+        auto shmAttrs = state->internalState.buffer->shm();
+        if (!dumped && frameNo >= dumpAt && shmAttrs.success) {
+            auto [data, fmt, len] = state->internalState.buffer->beginDataPtr(0);
+            FILE* f               = fopen("/tmp/hypr-frame.ppm", "wb");
+            if (f && data) {
+                const int W = shmAttrs.size.x, H = shmAttrs.size.y, stride = shmAttrs.stride;
+                fprintf(f, "P6\n%d %d\n255\n", W, H);
+                for (int y = 0; y < H; ++y) {
+                    const uint8_t* row = (const uint8_t*)data + (size_t)y * stride;
+                    for (int x = 0; x < W; ++x) {
+                        // XR24 (XRGB8888) little-endian in memory => bytes B,G,R,X
+                        const uint8_t* px = row + x * 4;
+                        fputc(px[2], f); // R
+                        fputc(px[1], f); // G
+                        fputc(px[0], f); // B
+                    }
+                }
+                fclose(f);
+                dumped = true;
+                backend->backend->log(AQ_LOG_DEBUG, "AQ_DUMP_FRAME: wrote /tmp/hypr-frame.ppm");
+            }
+        }
+    }
 
     readyForFrameCallback = true;
 
@@ -824,6 +960,33 @@ void Aquamarine::CWaylandOutput::scheduleFrame(const scheduleFrameReason reason)
 }
 
 Aquamarine::CWaylandBuffer::CWaylandBuffer(SP<IBuffer> buffer_, Hyprutils::Memory::CWeakPointer<CWaylandBackend> backend_) : buffer(buffer_), backend(backend_) {
+    auto shmAttrs = buffer_->shm();
+    if (backend->shmMode || shmAttrs.success) {
+        if (!shmAttrs.success) {
+            backend->backend->log(AQ_LOG_ERROR, "WaylandBuffer: shm mode but buffer is not a shm buffer");
+            return;
+        }
+
+        const size_t poolLen = (size_t)shmAttrs.stride * (size_t)shmAttrs.size.y;
+
+        waylandState.pool = makeShared<CCWlShmPool>(backend->waylandState.shm->sendCreatePool(shmAttrs.fd, poolLen));
+        if (!waylandState.pool) {
+            backend->backend->log(AQ_LOG_ERROR, "WaylandBuffer: failed to create a wl_shm pool");
+            return;
+        }
+
+        waylandState.buffer =
+            makeShared<CCWlBuffer>(waylandState.pool->sendCreateBuffer(0, shmAttrs.size.x, shmAttrs.size.y, shmAttrs.stride, shmFormatFromDRM(shmAttrs.format)));
+
+        if (!waylandState.buffer) {
+            backend->backend->log(AQ_LOG_ERROR, "WaylandBuffer: failed to create a wl_shm wl_buffer");
+            return;
+        }
+
+        waylandState.buffer->setRelease([this](CCWlBuffer* r) { pendingRelease = false; });
+        return;
+    }
+
     auto params = makeShared<CCZwpLinuxBufferParamsV1>(backend->waylandState.dmabuf->sendCreateParams());
 
     if (!params) {
@@ -847,6 +1010,8 @@ Aquamarine::CWaylandBuffer::CWaylandBuffer(SP<IBuffer> buffer_, Hyprutils::Memor
 Aquamarine::CWaylandBuffer::~CWaylandBuffer() {
     if (waylandState.buffer && waylandState.buffer->resource())
         waylandState.buffer->sendDestroy();
+    if (waylandState.pool && waylandState.pool->resource())
+        waylandState.pool->sendDestroy();
 }
 
 bool Aquamarine::CWaylandBuffer::good() {

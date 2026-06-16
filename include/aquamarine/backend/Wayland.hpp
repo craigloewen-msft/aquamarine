@@ -29,7 +29,8 @@ namespace Aquamarine {
 
       private:
         struct {
-            Hyprutils::Memory::CSharedPointer<CCWlBuffer> buffer;
+            Hyprutils::Memory::CSharedPointer<CCWlBuffer>   buffer;
+            Hyprutils::Memory::CSharedPointer<CCWlShmPool>  pool;
         } waylandState;
 
         Hyprutils::Memory::CWeakPointer<IBuffer>         buffer;
@@ -69,6 +70,14 @@ namespace Aquamarine {
         bool frameScheduledWhileWaiting = false;
         bool readyForFrameCallback      = false; // true after attaching a buffer
         bool frameScheduled             = false;
+
+        // The host must send (and we must ack) the first xdg_surface.configure
+        // before we may attach a buffer; attaching earlier triggers an
+        // "xdg_surface has never been configured" protocol error. Until then we
+        // stash the most recently committed buffer and present it once the first
+        // configure arrives.
+        bool                                              xdgConfigured = false;
+        Hyprutils::Memory::CSharedPointer<CWaylandBuffer> pendingCommitBuffer;
 
         struct {
             std::vector<std::pair<Hyprutils::Memory::CWeakPointer<IBuffer>, Hyprutils::Memory::CSharedPointer<CWaylandBuffer>>> buffers;
@@ -134,6 +143,7 @@ namespace Aquamarine {
         virtual void                                                       onReady();
         virtual std::vector<SDRMFormat>                                    getRenderFormats();
         virtual std::vector<SDRMFormat>                                    getCursorFormats();
+        virtual bool                                                       usesShmAllocator();
         virtual bool                                                       createOutput(const std::string& name = "");
         virtual Hyprutils::Memory::CSharedPointer<IAllocator>              preferredAllocator();
         virtual std::vector<Hyprutils::Memory::CSharedPointer<IAllocator>> getAllocators();
@@ -165,6 +175,11 @@ namespace Aquamarine {
 
         // dmabuf formats
         std::vector<SDRMFormat> dmabufFormats;
+
+        // shm (host-memory) present mode: used when the host compositor does not
+        // offer zwp_linux_dmabuf_v1 (e.g. WSLg, which only speaks wl_shm).
+        bool                    shmMode = false;
+        std::vector<SDRMFormat> shmFormats;
 
         struct {
             wl_display* display = nullptr;

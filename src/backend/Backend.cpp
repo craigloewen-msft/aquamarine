@@ -4,6 +4,7 @@
 #include <aquamarine/backend/DRM.hpp>
 #include <aquamarine/backend/Null.hpp>
 #include <aquamarine/allocator/GBM.hpp>
+#include <aquamarine/allocator/Shm.hpp>
 #include <hyprutils/os/FileDescriptor.hpp>
 #include <ranges>
 #include <sys/timerfd.h>
@@ -167,6 +168,18 @@ bool Aquamarine::CBackend::start() {
             }
             primaryAllocator = CGBMAllocator::create(fd, self);
             break;
+        }
+    }
+
+    // backends with no DRM node (e.g. a nested Wayland backend on WSLg, where the
+    // host compositor only speaks wl_shm) cannot use a GBM allocator. Fall back to
+    // a host-memory (shm) allocator so frames can be presented via wl_shm.
+    if (!primaryAllocator) {
+        for (auto const& b : implementations) {
+            if (b->usesShmAllocator()) {
+                primaryAllocator = CShmAllocator::create(self);
+                break;
+            }
         }
     }
 
@@ -385,4 +398,8 @@ int Aquamarine::CBackend::reopenDRMNode(int drmFD, bool allowRenderNode) {
 
 std::vector<SDRMFormat> Aquamarine::IBackendImplementation::getRenderableFormats() {
     return {};
+}
+
+bool Aquamarine::IBackendImplementation::usesShmAllocator() {
+    return false;
 }
