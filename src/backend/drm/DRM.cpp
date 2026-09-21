@@ -645,7 +645,7 @@ bool Aquamarine::CDRMBackend::initResources() {
 }
 
 bool Aquamarine::CDRMBackend::shouldBlit() {
-    return primary;
+    return static_cast<bool>(primary);
 }
 
 bool Aquamarine::CDRMBackend::initMgpu() {
